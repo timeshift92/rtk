@@ -76,6 +76,8 @@ use std::path::{Path, PathBuf};
 pub enum AgentTarget {
     /// Claude Code (default)
     Claude,
+    /// GitHub Copilot CLI / VS Code Copilot Chat
+    Copilot,
     /// Cursor Agent (editor and CLI)
     Cursor,
     /// Windsurf IDE (Cascade)
@@ -1659,10 +1661,14 @@ fn main() -> Result<()> {
             codex,
         } => {
             if show {
-                init::show_config(codex)?;
+                init::show_config(codex, agent == Some(AgentTarget::Copilot))?;
             } else if uninstall {
-                let cursor = agent == Some(AgentTarget::Cursor);
-                init::uninstall(global, gemini, codex, cursor, cli.verbose)?;
+                if agent == Some(AgentTarget::Copilot) {
+                    init::uninstall_copilot(global, cli.verbose)?;
+                } else {
+                    let cursor = agent == Some(AgentTarget::Cursor);
+                    init::uninstall(global, gemini, codex, cursor, cli.verbose)?;
+                }
             } else if gemini {
                 let patch_mode = if auto_patch {
                     init::PatchMode::Auto
@@ -1672,6 +1678,8 @@ fn main() -> Result<()> {
                     init::PatchMode::Ask
                 };
                 init::run_gemini(global, hook_only, patch_mode, cli.verbose)?;
+            } else if agent == Some(AgentTarget::Copilot) {
+                init::run_copilot(global, cli.verbose)?;
             } else {
                 let install_opencode = opencode;
                 let install_claude = !opencode;
@@ -2495,6 +2503,39 @@ mod tests {
                 "Meta-command {:?} should parse successfully",
                 args
             );
+        }
+    }
+
+    #[test]
+    fn test_init_agent_copilot_parses() {
+        let cli = Cli::try_parse_from(["rtk", "init", "--agent", "copilot"])
+            .expect("copilot agent init should parse");
+
+        match cli.command {
+            Commands::Init { agent, .. } => {
+                assert_eq!(agent, Some(AgentTarget::Copilot));
+            }
+            _ => panic!("Expected Init command"),
+        }
+    }
+
+    #[test]
+    fn test_init_global_agent_copilot_show_parses() {
+        let cli = Cli::try_parse_from(["rtk", "init", "-g", "--agent", "copilot", "--show"])
+            .expect("global copilot show should parse");
+
+        match cli.command {
+            Commands::Init {
+                global,
+                agent,
+                show,
+                ..
+            } => {
+                assert!(global);
+                assert!(show);
+                assert_eq!(agent, Some(AgentTarget::Copilot));
+            }
+            _ => panic!("Expected Init command"),
         }
     }
 

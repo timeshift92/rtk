@@ -287,6 +287,45 @@ rtk init --show             # Verify installation
 
 After install, **restart Claude Code**.
 
+## GitHub Copilot Support
+
+RTK supports both GitHub Copilot CLI and VS Code Copilot Chat.
+
+**Global instructions for Copilot (recommended for VS Code):**
+```bash
+rtk init -g --agent copilot
+```
+
+This writes `~/.copilot/copilot-instructions.md`, which Copilot CLI and VS Code Copilot Chat both load automatically.
+
+**Repository hook + instructions (for a specific repo):**
+```bash
+rtk init --agent copilot
+```
+
+This creates:
+- `.github/copilot-instructions.md`
+- `.github/hooks/rtk-rewrite.json`
+
+The hook uses the native Rust processor directly:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": "rtk hook copilot",
+        "cwd": ".",
+        "timeout": 5
+      }
+    ]
+  }
+}
+```
+
+This is cross-platform and works on Windows without shell wrappers or `jq`.
+
 ## Gemini CLI Support (Global)
 
 RTK supports Gemini CLI via a native Rust hook processor. The hook intercepts `run_shell_command` tool calls and rewrites them to `rtk` equivalents using the same rewrite engine as Claude Code.

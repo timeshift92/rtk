@@ -18,6 +18,9 @@ const OPENCODE_PLUGIN: &str = include_str!("../hooks/opencode-rtk.ts");
 // Embedded slim RTK awareness instructions
 const RTK_SLIM: &str = include_str!("../hooks/rtk-awareness.md");
 const RTK_SLIM_CODEX: &str = include_str!("../hooks/rtk-awareness-codex.md");
+const COPILOT_INSTRUCTIONS: &str = include_str!("../hooks/copilot-rtk-awareness.md");
+const COPILOT_GLOBAL_INSTRUCTIONS: &str = include_str!("../hooks/copilot-global-rtk-awareness.md");
+const COPILOT_HOOK_JSON: &str = include_str!("../.github/hooks/rtk-rewrite.json");
 
 /// Template written by `rtk init` when no filters.toml exists yet.
 const FILTERS_TEMPLATE: &str = r#"# Project-local RTK filters — commit this file with your repo.
@@ -1790,12 +1793,66 @@ fn remove_cursor_hook_from_json(root: &mut serde_json::Value) -> bool {
 }
 
 /// Show current rtk configuration
-pub fn show_config(codex: bool) -> Result<()> {
+pub fn show_config(codex: bool, copilot: bool) -> Result<()> {
     if codex {
         return show_codex_config();
     }
 
+    if copilot {
+        return show_copilot_config();
+    }
+
     show_claude_config()
+}
+
+fn show_copilot_config() -> Result<()> {
+    let copilot_dir = resolve_copilot_dir()?;
+    let global_instructions = copilot_dir.join("copilot-instructions.md");
+    let local_instructions = PathBuf::from(".github").join("copilot-instructions.md");
+    let local_hook = PathBuf::from(".github")
+        .join("hooks")
+        .join("rtk-rewrite.json");
+
+    println!("rtk Configuration (GitHub Copilot):\n");
+
+    if global_instructions.exists() {
+        println!(
+            "[ok] Global copilot-instructions.md: {}",
+            global_instructions.display()
+        );
+    } else {
+        println!("[--] Global copilot-instructions.md: not found");
+    }
+
+    if local_instructions.exists() {
+        println!(
+            "[ok] Local .github/copilot-instructions.md: {}",
+            local_instructions.display()
+        );
+    } else {
+        println!("[--] Local .github/copilot-instructions.md: not found");
+    }
+
+    if local_hook.exists() {
+        let content = fs::read_to_string(&local_hook)?;
+        if content.contains("rtk hook copilot") {
+            println!("[ok] Local .github/hooks/rtk-rewrite.json: RTK hook configured");
+        } else {
+            println!(
+                "[warn] Local .github/hooks/rtk-rewrite.json: exists but hook command is stale"
+            );
+        }
+    } else {
+        println!("[--] Local .github/hooks/rtk-rewrite.json: not found");
+    }
+
+    println!("\nUsage:");
+    println!("  rtk init -g --agent copilot   # Configure ~/.copilot/copilot-instructions.md");
+    println!("  rtk init --agent copilot      # Configure .github/copilot-instructions.md + hook");
+    println!("  rtk init --agent copilot --uninstall     # Remove local Copilot RTK files");
+    println!("  rtk init -g --agent copilot --uninstall  # Remove global Copilot RTK instructions");
+
+    Ok(())
 }
 
 fn show_claude_config() -> Result<()> {
@@ -2081,6 +2138,127 @@ fn show_codex_config() -> Result<()> {
     Ok(())
 }
 
+/// Resolve ~/.copilot directory with proper home expansion
+fn resolve_copilot_dir() -> Result<PathBuf> {
+    dirs::home_dir()
+        .map(|h| h.join(".copilot"))
+        .context("Cannot determine home directory. Is $HOME set?")
+}
+
+/// Entry point for `rtk init --agent copilot`
+pub fn run_copilot(global: bool, verbose: u8) -> Result<()> {
+    if global {
+        let copilot_dir = resolve_copilot_dir()?;
+        fs::create_dir_all(&copilot_dir).with_context(|| {
+            format!(
+                "Failed to create Copilot config directory: {}",
+                copilot_dir.display()
+            )
+        })?;
+
+        let instructions_path = copilot_dir.join("copilot-instructions.md");
+        write_if_changed(
+            &instructions_path,
+            COPILOT_GLOBAL_INSTRUCTIONS,
+            "copilot-instructions.md",
+            verbose,
+        )?;
+
+        println!("\nRTK configured for GitHub Copilot (global).\n");
+        println!("  Instructions: {}", instructions_path.display());
+        println!("  Covers: GitHub Copilot CLI + VS Code Copilot Chat");
+        println!("  Note: For repo-local PreToolUse hook safety nets, run `rtk init --agent copilot` inside a repository.");
+        println!("  Restart Copilot CLI / VS Code chat session. Test with: git status\n");
+        return Ok(());
+    }
+
+    let github_dir = PathBuf::from(".github");
+    let hooks_dir = github_dir.join("hooks");
+    fs::create_dir_all(&hooks_dir)
+        .with_context(|| format!("Failed to create hooks directory: {}", hooks_dir.display()))?;
+
+    let instructions_path = github_dir.join("copilot-instructions.md");
+    let hook_path = hooks_dir.join("rtk-rewrite.json");
+
+    write_if_changed(
+        &instructions_path,
+        COPILOT_INSTRUCTIONS,
+        "copilot-instructions.md",
+        verbose,
+    )?;
+    write_if_changed(&hook_path, COPILOT_HOOK_JSON, "Copilot hook", verbose)?;
+
+    println!("\nRTK configured for GitHub Copilot (repository).\n");
+    println!("  Instructions: {}", instructions_path.display());
+    println!("  Hook:         {}", hook_path.display());
+    println!("  Covers: VS Code Copilot Chat + GitHub Copilot CLI");
+    println!("  Hook command: rtk hook copilot");
+    println!("  Restart the Copilot session. Test with: git status\n");
+
+    Ok(())
+}
+
+pub fn uninstall_copilot(global: bool, verbose: u8) -> Result<()> {
+    let mut removed = Vec::new();
+
+    if global {
+        let copilot_dir = resolve_copilot_dir()?;
+        let instructions_path = copilot_dir.join("copilot-instructions.md");
+        if instructions_path.exists() {
+            fs::remove_file(&instructions_path).with_context(|| {
+                format!(
+                    "Failed to remove Copilot instructions: {}",
+                    instructions_path.display()
+                )
+            })?;
+            removed.push(format!(
+                "Global copilot-instructions.md: {}",
+                instructions_path.display()
+            ));
+        }
+    } else {
+        let instructions_path = PathBuf::from(".github").join("copilot-instructions.md");
+        let hook_path = PathBuf::from(".github")
+            .join("hooks")
+            .join("rtk-rewrite.json");
+
+        if instructions_path.exists() {
+            fs::remove_file(&instructions_path).with_context(|| {
+                format!(
+                    "Failed to remove Copilot instructions: {}",
+                    instructions_path.display()
+                )
+            })?;
+            removed.push(format!(
+                "Local copilot-instructions.md: {}",
+                instructions_path.display()
+            ));
+        }
+
+        if hook_path.exists() {
+            fs::remove_file(&hook_path).with_context(|| {
+                format!("Failed to remove Copilot hook: {}", hook_path.display())
+            })?;
+            removed.push(format!("Local Copilot hook: {}", hook_path.display()));
+        }
+    }
+
+    if removed.is_empty() {
+        println!("RTK Copilot support was not installed (nothing to remove)");
+    } else {
+        println!("RTK uninstalled for GitHub Copilot:");
+        for item in removed {
+            println!("  - {}", item);
+        }
+    }
+
+    if verbose > 0 {
+        eprintln!("Copilot uninstall complete");
+    }
+
+    Ok(())
+}
+
 fn run_opencode_only_mode(verbose: u8) -> Result<()> {
     let opencode_plugin_path = prepare_opencode_plugin_path()?;
     ensure_opencode_plugin_installed(&opencode_plugin_path, verbose)?;
@@ -2306,6 +2484,38 @@ fn uninstall_gemini(verbose: u8) -> Result<Vec<String>> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_copilot_hook_asset_uses_copilot_subcommand() {
+        assert!(
+            COPILOT_HOOK_JSON.contains("\"command\": \"rtk hook copilot\""),
+            "Copilot hook asset must invoke `rtk hook copilot`"
+        );
+    }
+
+    #[test]
+    fn test_copilot_repo_instructions_reference_correct_hook_command() {
+        assert!(
+            COPILOT_INSTRUCTIONS.contains("rtk hook copilot"),
+            "Repo Copilot instructions should document the correct hook command"
+        );
+        assert!(
+            COPILOT_INSTRUCTIONS.contains(".github/copilot-instructions.md"),
+            "Repo Copilot instructions should reference the repository instructions path"
+        );
+    }
+
+    #[test]
+    fn test_copilot_global_instructions_reference_global_path() {
+        assert!(
+            COPILOT_GLOBAL_INSTRUCTIONS.contains(".copilot/copilot-instructions.md"),
+            "Global Copilot instructions should reference the global Copilot instructions path"
+        );
+        assert!(
+            COPILOT_GLOBAL_INSTRUCTIONS.contains("rtk gain"),
+            "Global Copilot instructions should keep RTK meta commands documented"
+        );
+    }
 
     #[test]
     fn test_init_mentions_all_top_level_commands() {

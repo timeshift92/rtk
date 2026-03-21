@@ -78,6 +78,10 @@ rtk gain  # MUST show token savings, not "command not found"
   │         Hook + RTK.md (~10 tokens in context)
   │         Commands auto-rewritten transparently
   │
+  ├─ GitHub Copilot everywhere → rtk init -g --agent copilot
+  │         Global Copilot instructions in ~/.copilot/copilot-instructions.md
+  │         Helps both Copilot CLI and VS Code Copilot Chat use rtk
+  │
   ├─ YES, minimal → rtk init -g --hook-only
   │         Hook only, nothing added to CLAUDE.md
   │         Zero tokens in context
@@ -108,6 +112,26 @@ rtk init --show  # Check hook is installed and executable
 ```
 
 **Token savings**: ~99.5% reduction (2000 tokens → 10 tokens in context)
+
+### GitHub Copilot Setup
+
+**Best for: GitHub Copilot CLI and VS Code Copilot Chat**
+
+```bash
+# Global instructions for all Copilot sessions
+rtk init -g --agent copilot
+
+# Repository-local instructions + PreToolUse hook
+rtk init --agent copilot
+```
+
+Global mode writes `~/.copilot/copilot-instructions.md`, which Copilot CLI and VS Code Copilot Chat both load automatically.
+
+Repository mode writes:
+- `.github/copilot-instructions.md`
+- `.github/hooks/rtk-rewrite.json`
+
+The repository hook runs `rtk hook copilot`, which is cross-platform and works on Windows without `bash` or `jq`.
 
 **What is settings.json?**
 Claude Code's hook registry. RTK adds a PreToolUse hook that rewrites commands transparently. Without this, Claude won't invoke the hook automatically.
