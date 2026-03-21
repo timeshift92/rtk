@@ -1,6 +1,6 @@
 //! Hook integrity verification via SHA-256.
 //!
-//! RTK installs a PreToolUse hook (`rtk-rewrite.sh`) that auto-approves
+//! RTK installs a PreToolUse hook wrapper (`rtk-rewrite.sh` / `rtk-rewrite.cmd`) that auto-approves
 //! rewritten commands with `permissionDecision: "allow"`. Because this
 //! hook bypasses Claude Code's permission prompts, any unauthorized
 //! modification represents a command injection vector.
@@ -178,10 +178,18 @@ fn read_stored_hash(path: &Path) -> Result<String> {
     Ok(hash.to_string())
 }
 
-/// Resolve the default hook path (~/.claude/hooks/rtk-rewrite.sh)
+fn hook_filename() -> &'static str {
+    if cfg!(windows) {
+        "rtk-rewrite.cmd"
+    } else {
+        "rtk-rewrite.sh"
+    }
+}
+
+/// Resolve the default hook path (~/.claude/hooks/rtk-rewrite.*)
 pub fn resolve_hook_path() -> Result<PathBuf> {
     dirs::home_dir()
-        .map(|h| h.join(".claude").join("hooks").join("rtk-rewrite.sh"))
+        .map(|h| h.join(".claude").join("hooks").join(hook_filename()))
         .context("Cannot determine home directory. Is $HOME set?")
 }
 

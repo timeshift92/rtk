@@ -8,6 +8,7 @@ use crate::integrity;
 
 // Embedded hook script (guards before set -euo pipefail)
 const REWRITE_HOOK: &str = include_str!("../hooks/rtk-rewrite.sh");
+const REWRITE_HOOK_CMD: &str = include_str!("../hooks/rtk-rewrite.cmd");
 
 // Embedded Cursor hook script (preToolUse format)
 const CURSOR_REWRITE_HOOK: &str = include_str!("../hooks/cursor-rtk-rewrite.sh");
@@ -183,7 +184,8 @@ rtk wget <url>          # Compact download output (65%)
 ```bash
 rtk gain                # View token savings statistics
 rtk gain --history      # View command history with savings
-rtk discover            # Analyze Claude Code sessions for missed RTK usage
+rtk discover            # Analyze Claude Code and Copilot shell sessions for missed RTK usage
+rtk pwsh -Command pwd   # Route PowerShell builtins/aliases through RTK
 rtk proxy <cmd>         # Run command without filtering (for debugging)
 rtk init                # Add RTK instructions to CLAUDE.md
 rtk init --global       # Add RTK to ~/.claude/CLAUDE.md
@@ -291,24 +293,40 @@ fn prepare_hook_paths() -> Result<(PathBuf, PathBuf)> {
     let hook_dir = claude_dir.join("hooks");
     fs::create_dir_all(&hook_dir)
         .with_context(|| format!("Failed to create hook directory: {}", hook_dir.display()))?;
-    let hook_path = hook_dir.join("rtk-rewrite.sh");
+    let hook_path = hook_dir.join(claude_hook_filename());
     Ok((hook_dir, hook_path))
 }
 
+fn claude_hook_filename() -> &'static str {
+    if cfg!(windows) {
+        "rtk-rewrite.cmd"
+    } else {
+        "rtk-rewrite.sh"
+    }
+}
+
+fn claude_hook_contents() -> &'static str {
+    if cfg!(windows) {
+        REWRITE_HOOK_CMD
+    } else {
+        REWRITE_HOOK
+    }
+}
+
 /// Write hook file if missing or outdated, return true if changed
-#[cfg(unix)]
 fn ensure_hook_installed(hook_path: &Path, verbose: u8) -> Result<bool> {
+    let desired = claude_hook_contents();
     let changed = if hook_path.exists() {
         let existing = fs::read_to_string(hook_path)
             .with_context(|| format!("Failed to read existing hook: {}", hook_path.display()))?;
 
-        if existing == REWRITE_HOOK {
+        if existing == desired {
             if verbose > 0 {
                 eprintln!("Hook already up to date: {}", hook_path.display());
             }
             false
         } else {
-            fs::write(hook_path, REWRITE_HOOK)
+            fs::write(hook_path, desired)
                 .with_context(|| format!("Failed to write hook to {}", hook_path.display()))?;
             if verbose > 0 {
                 eprintln!("Updated hook: {}", hook_path.display());
@@ -316,7 +334,7 @@ fn ensure_hook_installed(hook_path: &Path, verbose: u8) -> Result<bool> {
             true
         }
     } else {
-        fs::write(hook_path, REWRITE_HOOK)
+        fs::write(hook_path, desired)
             .with_context(|| format!("Failed to write hook to {}", hook_path.display()))?;
         if verbose > 0 {
             eprintln!("Created hook: {}", hook_path.display());
@@ -324,10 +342,12 @@ fn ensure_hook_installed(hook_path: &Path, verbose: u8) -> Result<bool> {
         true
     };
 
-    // Set executable permissions
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(hook_path, fs::Permissions::from_mode(0o755))
-        .with_context(|| format!("Failed to set hook permissions: {}", hook_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(hook_path, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("Failed to set hook permissions: {}", hook_path.display()))?;
+    }
 
     // Store SHA-256 hash for runtime integrity verification.
     // Always store (idempotent) to ensure baseline exists even for
@@ -462,7 +482,7 @@ fn remove_hook_from_json(root: &mut serde_json::Value) -> bool {
         if let Some(hooks_array) = entry.get("hooks").and_then(|h| h.as_array()) {
             for hook in hooks_array {
                 if let Some(command) = hook.get("command").and_then(|c| c.as_str()) {
-                    if command.contains("rtk-rewrite.sh") {
+                    if command.contains("rtk-rewrite.sh") || command.contains("rtk-rewrite.cmd") {
                         return false; // Remove this entry
                     }
                 }
@@ -836,7 +856,7 @@ fn insert_hook_entry(root: &mut serde_json::Value, hook_command: &str) {
 }
 
 /// Check if RTK hook is already present in settings.json
-/// Matches on rtk-rewrite.sh substring to handle different path formats
+/// Matches on the RTK hook filename to handle different path formats.
 fn hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
     let pre_tool_use_array = match root
         .get("hooks")
@@ -853,27 +873,14 @@ fn hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
         .flatten()
         .filter_map(|hook| hook.get("command")?.as_str())
         .any(|cmd| {
-            // Exact match OR both contain rtk-rewrite.sh
+            // Exact match OR both contain the installed RTK hook filename.
             cmd == hook_command
                 || (cmd.contains("rtk-rewrite.sh") && hook_command.contains("rtk-rewrite.sh"))
+                || (cmd.contains("rtk-rewrite.cmd") && hook_command.contains("rtk-rewrite.cmd"))
         })
 }
 
 /// Default mode: hook + slim RTK.md + @RTK.md reference
-#[cfg(not(unix))]
-fn run_default_mode(
-    _global: bool,
-    _patch_mode: PatchMode,
-    _verbose: u8,
-    _install_opencode: bool,
-) -> Result<()> {
-    eprintln!("[warn] Hook-based mode requires Unix (macOS/Linux).");
-    eprintln!("    Windows: use --claude-md mode for full injection.");
-    eprintln!("    Falling back to --claude-md mode.");
-    run_claude_md_mode(_global, _verbose, _install_opencode)
-}
-
-#[cfg(unix)]
 fn run_default_mode(
     global: bool,
     patch_mode: PatchMode,
@@ -1007,17 +1014,6 @@ fn generate_global_filters_template(verbose: u8) -> Result<()> {
 }
 
 /// Hook-only mode: just the hook, no RTK.md
-#[cfg(not(unix))]
-fn run_hook_only_mode(
-    _global: bool,
-    _patch_mode: PatchMode,
-    _verbose: u8,
-    _install_opencode: bool,
-) -> Result<()> {
-    anyhow::bail!("Hook install requires Unix (macOS/Linux). Use WSL or --claude-md mode.")
-}
-
-#[cfg(unix)]
 fn run_hook_only_mode(
     global: bool,
     patch_mode: PatchMode,
@@ -1857,7 +1853,7 @@ fn show_copilot_config() -> Result<()> {
 
 fn show_claude_config() -> Result<()> {
     let claude_dir = resolve_claude_dir()?;
-    let hook_path = claude_dir.join("hooks").join("rtk-rewrite.sh");
+    let hook_path = claude_dir.join("hooks").join(claude_hook_filename());
     let rtk_md_path = claude_dir.join("RTK.md");
     let global_claude_md = claude_dir.join("CLAUDE.md");
     let local_claude_md = PathBuf::from("CLAUDE.md");
@@ -1908,7 +1904,17 @@ fn show_claude_config() -> Result<()> {
 
         #[cfg(not(unix))]
         {
-            println!("[ok] Hook: {} (exists)", hook_path.display());
+            let hook_content = fs::read_to_string(&hook_path).unwrap_or_default();
+            let hook_version = crate::hook_check::parse_hook_version(&hook_content);
+            if hook_content.contains("rtk hook copilot") && hook_version >= 2 {
+                println!(
+                    "[ok] Hook: {} (delegates to rtk hook copilot, version {})",
+                    hook_path.display(),
+                    hook_version
+                );
+            } else {
+                println!("[warn] Hook: {} (outdated)", hook_path.display());
+            }
         }
     } else {
         println!("[--] Hook: not found");
@@ -2514,6 +2520,18 @@ mod tests {
         assert!(
             COPILOT_GLOBAL_INSTRUCTIONS.contains("rtk gain"),
             "Global Copilot instructions should keep RTK meta commands documented"
+        );
+    }
+
+    #[test]
+    fn test_windows_claude_hook_asset_uses_copilot_processor() {
+        assert!(
+            REWRITE_HOOK_CMD.contains("rtk hook copilot"),
+            "Windows Claude hook should delegate to `rtk hook copilot`"
+        );
+        assert!(
+            REWRITE_HOOK_CMD.contains("rtk-hook-version: 2"),
+            "Windows Claude hook should carry the current hook version"
         );
     }
 

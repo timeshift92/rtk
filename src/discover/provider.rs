@@ -239,10 +239,226 @@ impl SessionProvider for ClaudeProvider {
     }
 }
 
+pub struct CopilotProvider;
+
+impl CopilotProvider {
+    fn session_state_dir() -> Result<PathBuf> {
+        let home = dirs::home_dir().context("could not determine home directory")?;
+        let dir = home.join(".copilot").join("session-state");
+        if !dir.exists() {
+            anyhow::bail!(
+                "Copilot session-state directory not found: {}\nMake sure GitHub Copilot has been used at least once.",
+                dir.display()
+            );
+        }
+        Ok(dir)
+    }
+
+    fn session_id_from_path(path: &Path) -> String {
+        if path.file_name().and_then(|n| n.to_str()) == Some("events.jsonl") {
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string()
+        } else {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string()
+        }
+    }
+
+    fn extract_session_cwd(path: &Path) -> Result<Option<String>> {
+        let file =
+            fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let reader = BufReader::new(file);
+
+        for line in reader.lines().take(25) {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+
+            if !line.contains("\"type\":\"session.start\"") {
+                continue;
+            }
+
+            let entry: serde_json::Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if let Some(cwd) = entry.pointer("/data/context/cwd").and_then(|c| c.as_str()) {
+                return Ok(Some(cwd.to_string()));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn session_matches_filter(path: &Path, project_filter: &str) -> bool {
+        let Ok(Some(cwd)) = Self::extract_session_cwd(path) else {
+            return false;
+        };
+
+        cwd.eq_ignore_ascii_case(project_filter)
+            || cwd.starts_with(project_filter)
+            || cwd.contains(project_filter)
+    }
+
+    fn is_shell_tool(tool_name: &str) -> bool {
+        matches!(tool_name, "powershell" | "bash" | "shell")
+    }
+}
+
+impl SessionProvider for CopilotProvider {
+    fn discover_sessions(
+        &self,
+        project_filter: Option<&str>,
+        since_days: Option<u64>,
+    ) -> Result<Vec<PathBuf>> {
+        let session_state_dir = Self::session_state_dir()?;
+        let cutoff = since_days.map(|days| {
+            SystemTime::now()
+                .checked_sub(Duration::from_secs(days * 86400))
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+        });
+
+        let mut sessions = Vec::new();
+
+        for walk_entry in WalkDir::new(&session_state_dir)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let file_path = walk_entry.path();
+            if file_path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+
+            if let Some(cutoff_time) = cutoff {
+                if let Ok(meta) = fs::metadata(file_path) {
+                    if let Ok(mtime) = meta.modified() {
+                        if mtime < cutoff_time {
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if let Some(filter) = project_filter {
+                if !Self::session_matches_filter(file_path, filter) {
+                    continue;
+                }
+            }
+
+            sessions.push(file_path.to_path_buf());
+        }
+
+        Ok(sessions)
+    }
+
+    fn extract_commands(&self, path: &Path) -> Result<Vec<ExtractedCommand>> {
+        let file =
+            fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let reader = BufReader::new(file);
+
+        let session_id = Self::session_id_from_path(path);
+        let mut pending_tool_uses: Vec<(String, String, usize)> = Vec::new();
+        let mut tool_results: HashMap<String, (usize, String, bool)> = HashMap::new();
+        let mut commands = Vec::new();
+        let mut sequence_counter = 0;
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+
+            if !line.contains("\"type\":\"tool.execution_start\"")
+                && !line.contains("\"type\":\"tool.execution_complete\"")
+            {
+                continue;
+            }
+
+            let entry: serde_json::Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let entry_type = entry.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+            match entry_type {
+                "tool.execution_start" => {
+                    let tool_name = entry
+                        .pointer("/data/toolName")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("");
+                    if !Self::is_shell_tool(tool_name) {
+                        continue;
+                    }
+
+                    if let (Some(id), Some(cmd)) = (
+                        entry.pointer("/data/toolCallId").and_then(|i| i.as_str()),
+                        entry
+                            .pointer("/data/arguments/command")
+                            .and_then(|c| c.as_str()),
+                    ) {
+                        pending_tool_uses.push((id.to_string(), cmd.to_string(), sequence_counter));
+                        sequence_counter += 1;
+                    }
+                }
+                "tool.execution_complete" => {
+                    if let Some(id) = entry.pointer("/data/toolCallId").and_then(|i| i.as_str()) {
+                        let content = entry
+                            .pointer("/data/result/content")
+                            .and_then(|c| c.as_str())
+                            .or_else(|| {
+                                entry
+                                    .pointer("/data/result/detailedContent")
+                                    .and_then(|c| c.as_str())
+                            })
+                            .unwrap_or("");
+                        let is_error = !entry
+                            .pointer("/data/success")
+                            .and_then(|s| s.as_bool())
+                            .unwrap_or(true);
+                        let content_preview: String = content.chars().take(1000).collect();
+
+                        tool_results
+                            .insert(id.to_string(), (content.len(), content_preview, is_error));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for (tool_id, command, sequence_index) in pending_tool_uses {
+            let (output_len, output_content, is_error) = tool_results
+                .get(&tool_id)
+                .map(|(len, content, err)| (Some(*len), Some(content.clone()), *err))
+                .unwrap_or((None, None, false));
+
+            commands.push(ExtractedCommand {
+                command,
+                output_len,
+                session_id: session_id.clone(),
+                output_content,
+                is_error,
+                sequence_index,
+            });
+        }
+
+        Ok(commands)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+    use tempfile::TempDir;
 
     fn make_jsonl(lines: &[&str]) -> tempfile::NamedTempFile {
         let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -389,5 +605,71 @@ mod tests {
         assert_eq!(cmds[0].command, "first");
         assert_eq!(cmds[1].command, "second");
         assert_eq!(cmds[2].command, "third");
+    }
+
+    #[test]
+    fn test_extract_copilot_powershell() {
+        let jsonl = make_jsonl(&[
+            r#"{"type":"session.start","data":{"context":{"cwd":"C:\\Users\\times\\Desktop\\rtk"}}}"#,
+            r#"{"type":"tool.execution_start","data":{"toolCallId":"call_1","toolName":"powershell","arguments":{"command":"git status","description":"Check git","initial_wait":30}}}"#,
+            r#"{"type":"tool.execution_complete","data":{"toolCallId":"call_1","success":true,"result":{"content":"On branch main\nnothing to commit"}}}"#,
+        ]);
+
+        let provider = CopilotProvider;
+        let cmds = provider.extract_commands(jsonl.path()).unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].command, "git status");
+        assert_eq!(
+            cmds[0].output_len,
+            Some("On branch main\nnothing to commit".len())
+        );
+        assert!(!cmds[0].is_error);
+    }
+
+    #[test]
+    fn test_extract_copilot_non_shell_ignored() {
+        let jsonl = make_jsonl(&[
+            r#"{"type":"tool.execution_start","data":{"toolCallId":"call_1","toolName":"view","arguments":{"path":"C:\\Users\\times\\README.md"}}}"#,
+            r#"{"type":"tool.execution_complete","data":{"toolCallId":"call_1","success":true,"result":{"content":"README"}}}"#,
+        ]);
+
+        let provider = CopilotProvider;
+        let cmds = provider.extract_commands(jsonl.path()).unwrap();
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn test_extract_copilot_session_cwd() {
+        let jsonl = make_jsonl(&[
+            r#"{"type":"session.start","data":{"context":{"cwd":"C:\\Users\\times\\Desktop\\rtk"}}}"#,
+        ]);
+
+        let cwd = CopilotProvider::extract_session_cwd(jsonl.path()).unwrap();
+        assert_eq!(cwd.as_deref(), Some("C:\\Users\\times\\Desktop\\rtk"));
+    }
+
+    #[test]
+    fn test_copilot_events_jsonl_uses_parent_as_session_id() {
+        let temp = TempDir::new().unwrap();
+        let session_dir = temp.path().join("abc-session");
+        fs::create_dir_all(&session_dir).unwrap();
+        let events = session_dir.join("events.jsonl");
+        fs::write(
+            &events,
+            concat!(
+                r#"{"type":"session.start","data":{"context":{"cwd":"C:\\Users\\times"}}}"#,
+                "\n",
+                r#"{"type":"tool.execution_start","data":{"toolCallId":"call_1","toolName":"powershell","arguments":{"command":"rtk gain"}}}"#,
+                "\n",
+                r#"{"type":"tool.execution_complete","data":{"toolCallId":"call_1","success":true,"result":{"content":"ok"}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let provider = CopilotProvider;
+        let cmds = provider.extract_commands(&events).unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].session_id, "abc-session");
     }
 }

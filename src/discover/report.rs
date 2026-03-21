@@ -76,7 +76,7 @@ pub fn format_text(report: &DiscoverReport, limit: usize, verbose: bool) -> Stri
     out.push_str(&"=".repeat(52));
     out.push('\n');
     out.push_str(&format!(
-        "Scanned: {} sessions (last {} days), {} Bash commands\n",
+        "Scanned: {} sessions (last {} days), {} shell commands\n",
         report.sessions_scanned, report.since_days, report.total_commands
     ));
     out.push_str(&format!(
@@ -169,7 +169,9 @@ pub fn format_text(report: &DiscoverReport, limit: usize, verbose: bool) -> Stri
     if let Some(home) = dirs::home_dir() {
         let cursor_hook = home.join(".cursor").join("hooks").join("rtk-rewrite.sh");
         if cursor_hook.exists() {
-            out.push_str("\nNote: Cursor sessions are tracked via `rtk gain` (discover scans Claude Code only)\n");
+            out.push_str(
+                "\nNote: Cursor sessions are tracked via `rtk gain` (discover scans Claude Code and Copilot shell sessions)\n",
+            );
         }
     }
 

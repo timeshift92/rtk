@@ -5,8 +5,9 @@ pub mod rules;
 
 use anyhow::Result;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
-use provider::{ClaudeProvider, SessionProvider};
+use provider::{ClaudeProvider, CopilotProvider, SessionProvider};
 use registry::{
     category_avg_tokens, classify_command, has_rtk_disabled_prefix, split_command_chain,
     strip_disabled_prefix, Classification,
@@ -30,6 +31,21 @@ struct UnsupportedBucket {
     example: String,
 }
 
+#[derive(Clone, Copy)]
+enum SessionSource {
+    Claude,
+    Copilot,
+}
+
+impl SessionSource {
+    fn label(self) -> &'static str {
+        match self {
+            SessionSource::Claude => "claude",
+            SessionSource::Copilot => "copilot",
+        }
+    }
+}
+
 pub fn run(
     project: Option<&str>,
     all: bool,
@@ -38,27 +54,41 @@ pub fn run(
     format: &str,
     verbose: u8,
 ) -> Result<()> {
-    let provider = ClaudeProvider;
+    let claude_provider = ClaudeProvider;
+    let copilot_provider = CopilotProvider;
 
-    // Determine project filter
-    let project_filter = if all {
-        None
+    let (claude_filter, copilot_filter) = if all {
+        (None, None)
     } else if let Some(p) = project {
-        Some(p.to_string())
+        (Some(p.to_string()), Some(p.to_string()))
     } else {
-        // Default: current working directory
         let cwd = std::env::current_dir()?;
         let cwd_str = cwd.to_string_lossy().to_string();
-        let encoded = ClaudeProvider::encode_project_path(&cwd_str);
-        Some(encoded)
+        (
+            Some(ClaudeProvider::encode_project_path(&cwd_str)),
+            Some(cwd_str),
+        )
     };
 
-    let sessions = provider.discover_sessions(project_filter.as_deref(), Some(since_days))?;
+    let mut sessions: Vec<(SessionSource, PathBuf)> = Vec::new();
+
+    match claude_provider.discover_sessions(claude_filter.as_deref(), Some(since_days))? {
+        found => sessions.extend(found.into_iter().map(|p| (SessionSource::Claude, p))),
+    }
+
+    match copilot_provider.discover_sessions(copilot_filter.as_deref(), Some(since_days)) {
+        Ok(found) => sessions.extend(found.into_iter().map(|p| (SessionSource::Copilot, p))),
+        Err(err) => {
+            if verbose > 0 {
+                eprintln!("Skipping Copilot sessions: {err}");
+            }
+        }
+    }
 
     if verbose > 0 {
         eprintln!("Scanning {} session files...", sessions.len());
-        for s in &sessions {
-            eprintln!("  {}", s.display());
+        for (source, path) in &sessions {
+            eprintln!("  [{}] {}", source.label(), path.display());
         }
     }
 
@@ -70,12 +100,21 @@ pub fn run(
     let mut supported_map: HashMap<&'static str, SupportedBucket> = HashMap::new();
     let mut unsupported_map: HashMap<String, UnsupportedBucket> = HashMap::new();
 
-    for session_path in &sessions {
-        let extracted = match provider.extract_commands(session_path) {
+    for (source, session_path) in &sessions {
+        let extracted = match source {
+            SessionSource::Claude => claude_provider.extract_commands(session_path),
+            SessionSource::Copilot => copilot_provider.extract_commands(session_path),
+        };
+        let extracted = match extracted {
             Ok(cmds) => cmds,
             Err(e) => {
                 if verbose > 0 {
-                    eprintln!("Warning: skipping {}: {}", session_path.display(), e);
+                    eprintln!(
+                        "Warning: skipping [{}] {}: {}",
+                        source.label(),
+                        session_path.display(),
+                        e
+                    );
                 }
                 parse_errors += 1;
                 continue;
@@ -126,7 +165,7 @@ pub fn run(
 
                         // Estimate tokens for this command
                         let output_tokens = if let Some(len) = ext_cmd.output_len {
-                            // Real: from tool_result content length
+                            // Real: from tool_result / tool execution content length
                             len / 4
                         } else {
                             // Fallback: category average
@@ -156,11 +195,9 @@ pub fn run(
                         bucket.count += 1;
                     }
                     Classification::Ignored => {
-                        // Check if it starts with "rtk "
                         if part.trim().starts_with("rtk ") {
                             already_rtk += 1;
                         }
-                        // Otherwise just skip
                     }
                 }
             }

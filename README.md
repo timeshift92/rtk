@@ -215,6 +215,7 @@ rtk curl <url>                  # Auto-detect JSON + schema
 rtk wget <url>                  # Download, strip progress bars
 rtk summary <long command>      # Heuristic summary
 rtk proxy <command>             # Raw passthrough + tracking
+rtk pwsh -Command pwd           # PowerShell builtins/aliases via RTK
 ```
 
 ### Token Savings Analytics
@@ -227,6 +228,7 @@ rtk gain --all --format json    # JSON export for dashboards
 
 rtk discover                    # Find missed savings opportunities
 rtk discover --all --since 7    # All projects, last 7 days
+                                 # Includes Claude Code + Copilot shell sessions
 
 rtk session                     # Show RTK adoption across recent sessions
 ```
@@ -284,6 +286,8 @@ rtk init -g --auto-patch    # Non-interactive (CI/CD)
 rtk init -g --hook-only     # Hook only, no RTK.md
 rtk init --show             # Verify installation
 ```
+
+On Windows, RTK installs `~/.claude/hooks/rtk-rewrite.cmd`; on macOS/Linux it installs `~/.claude/hooks/rtk-rewrite.sh`.
 
 After install, **restart Claude Code**.
 

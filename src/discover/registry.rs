@@ -54,11 +54,194 @@ lazy_static! {
         Regex::new(r"^(?:(?:-C\s+\S+|-c\s+\S+|--git-dir(?:=\S+|\s+\S+)|--work-tree(?:=\S+|\s+\S+)|--no-pager|--no-optional-locks|--bare|--literal-pathspecs)\s+)+").unwrap();
 }
 
+const PWSH_LS_ALIASES: &[&str] = &["dir", "Get-ChildItem"];
+const PWSH_READ_ALIASES: &[&str] = &["Get-Content", "type"];
+const PWSH_GREP_ALIASES: &[&str] = &["Select-String", "sls"];
+const PWSH_PWSH_ALIASES: &[&str] = &["pwd", "Get-Location"];
+
+#[derive(Clone, Copy)]
+enum PwshBuiltinRoute {
+    Pwsh,
+    Ls,
+    Read,
+}
+
+fn is_windows_shell_context() -> bool {
+    cfg!(windows)
+}
+
+fn strip_case_insensitive_prefix<'a>(cmd: &'a str, prefix: &str) -> Option<&'a str> {
+    if cmd.len() < prefix.len() || !cmd[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+
+    if cmd.len() == prefix.len() {
+        return Some("");
+    }
+
+    if cmd.as_bytes()[prefix.len()].is_ascii_whitespace() {
+        Some(cmd[prefix.len() + 1..].trim_start())
+    } else {
+        None
+    }
+}
+
+fn has_shell_redirection(rest: &str) -> bool {
+    let trimmed = rest.trim();
+    trimmed.contains('>') || trimmed.contains('<') || trimmed.contains('|')
+}
+
+fn safe_ls_args(rest: &str) -> bool {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if has_shell_redirection(trimmed) {
+        return false;
+    }
+
+    trimmed.split_whitespace().all(|token| {
+        if token == "--all" {
+            return true;
+        }
+        if token.starts_with('-') {
+            if token.starts_with("--") {
+                return false;
+            }
+            token
+                .trim_start_matches('-')
+                .chars()
+                .all(|c| matches!(c, 'a' | 'l' | 'h'))
+        } else {
+            true
+        }
+    })
+}
+
+fn safe_read_args(rest: &str) -> bool {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() || has_shell_redirection(trimmed) {
+        return false;
+    }
+
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    tokens.len() == 1 && !tokens[0].starts_with('-')
+}
+
+fn route_powershell_builtin(cmd: &str) -> Option<PwshBuiltinRoute> {
+    if !is_windows_shell_context() {
+        return None;
+    }
+
+    for alias in PWSH_PWSH_ALIASES {
+        if strip_case_insensitive_prefix(cmd, alias).is_some() {
+            return Some(PwshBuiltinRoute::Pwsh);
+        }
+    }
+
+    for alias in PWSH_LS_ALIASES {
+        if let Some(rest) = strip_case_insensitive_prefix(cmd, alias) {
+            return Some(if safe_ls_args(rest) {
+                PwshBuiltinRoute::Ls
+            } else {
+                PwshBuiltinRoute::Pwsh
+            });
+        }
+    }
+
+    for alias in PWSH_READ_ALIASES {
+        if let Some(rest) = strip_case_insensitive_prefix(cmd, alias) {
+            return Some(if safe_read_args(rest) {
+                PwshBuiltinRoute::Read
+            } else {
+                PwshBuiltinRoute::Pwsh
+            });
+        }
+    }
+
+    for alias in PWSH_GREP_ALIASES {
+        if strip_case_insensitive_prefix(cmd, alias).is_some() {
+            return Some(PwshBuiltinRoute::Pwsh);
+        }
+    }
+
+    None
+}
+
+fn classify_powershell_builtin(cmd: &str) -> Option<Classification> {
+    match route_powershell_builtin(cmd)? {
+        PwshBuiltinRoute::Pwsh => Some(Classification::Supported {
+            rtk_equivalent: "rtk pwsh",
+            category: "PowerShell",
+            estimated_savings_pct: 20.0,
+            status: super::report::RtkStatus::Passthrough,
+        }),
+        PwshBuiltinRoute::Ls => Some(Classification::Supported {
+            rtk_equivalent: "rtk ls",
+            category: "Files",
+            estimated_savings_pct: 65.0,
+            status: super::report::RtkStatus::Existing,
+        }),
+        PwshBuiltinRoute::Read => Some(Classification::Supported {
+            rtk_equivalent: "rtk read",
+            category: "Files",
+            estimated_savings_pct: 60.0,
+            status: super::report::RtkStatus::Existing,
+        }),
+    }
+}
+
+fn rewrite_powershell_builtin(seg: &str) -> Option<String> {
+    if !is_windows_shell_context() {
+        return None;
+    }
+
+    let trimmed = seg.trim();
+    let stripped_cow = ENV_PREFIX.replace(trimmed, "");
+    let env_prefix_len = trimmed.len() - stripped_cow.len();
+    let env_prefix = &trimmed[..env_prefix_len];
+    let cmd_clean = stripped_cow.trim();
+
+    match route_powershell_builtin(cmd_clean)? {
+        PwshBuiltinRoute::Pwsh => Some(format!(r#"{env_prefix}rtk pwsh -Command "{cmd_clean}""#)),
+        PwshBuiltinRoute::Ls => Some(
+            format!(
+                "{env_prefix}rtk ls {}",
+                cmd_clean
+                    .split_once(char::is_whitespace)
+                    .map(|(_, r)| r.trim_start())
+                    .unwrap_or("")
+            )
+            .trim_end()
+            .to_string(),
+        ),
+        PwshBuiltinRoute::Read => Some(
+            format!(
+                "{env_prefix}rtk read {}",
+                cmd_clean
+                    .split_once(char::is_whitespace)
+                    .map(|(_, r)| r.trim_start())
+                    .unwrap_or("")
+            )
+            .trim_end()
+            .to_string(),
+        ),
+    }
+}
+
+fn excluded_command(base: &str, excluded: &[String]) -> bool {
+    excluded.iter().any(|e| e.eq_ignore_ascii_case(base))
+}
+
 /// Classify a single (already-split) command.
 pub fn classify_command(cmd: &str) -> Classification {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
         return Classification::Ignored;
+    }
+
+    if let Some(classification) = classify_powershell_builtin(trimmed) {
+        return classification;
     }
 
     // Check ignored
@@ -584,12 +767,16 @@ fn rewrite_segment(seg: &str, excluded: &[String]) -> Option<String> {
         return rewrite_tail_lines(trimmed);
     }
 
+    if let Some(rewritten) = rewrite_powershell_builtin_with_exclusions(trimmed, excluded) {
+        return Some(rewritten);
+    }
+
     // Use classify_command for correct ignore/prefix handling
     let rtk_equivalent = match classify_command(trimmed) {
         Classification::Supported { rtk_equivalent, .. } => {
             // Check if the base command is excluded from rewriting (#243)
             let base = trimmed.split_whitespace().next().unwrap_or("");
-            if excluded.iter().any(|e| e == base) {
+            if excluded_command(base, excluded) {
                 return None;
             }
             rtk_equivalent
@@ -636,6 +823,22 @@ fn rewrite_segment(seg: &str, excluded: &[String]) -> Option<String> {
     }
 
     None
+}
+
+fn rewrite_powershell_builtin_with_exclusions(seg: &str, excluded: &[String]) -> Option<String> {
+    if !is_windows_shell_context() {
+        return None;
+    }
+
+    let trimmed = seg.trim();
+    let stripped_cow = ENV_PREFIX.replace(trimmed, "");
+    let cmd_clean = stripped_cow.trim();
+    let base = cmd_clean.split_whitespace().next().unwrap_or("");
+    if excluded_command(base, excluded) {
+        return None;
+    }
+
+    rewrite_powershell_builtin(seg)
 }
 
 /// Strip a command prefix with word-boundary check.
@@ -758,6 +961,84 @@ mod tests {
             classify_command("echo hello world"),
             Classification::Ignored
         );
+    }
+
+    #[test]
+    fn test_classify_pwd_as_pwsh_on_windows() {
+        if cfg!(windows) {
+            assert_eq!(
+                classify_command("pwd"),
+                Classification::Supported {
+                    rtk_equivalent: "rtk pwsh",
+                    category: "PowerShell",
+                    estimated_savings_pct: 20.0,
+                    status: RtkStatus::Passthrough,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_get_child_item_as_ls_on_windows() {
+        if cfg!(windows) {
+            assert_eq!(
+                classify_command("Get-ChildItem -Force"),
+                Classification::Supported {
+                    rtk_equivalent: "rtk pwsh",
+                    category: "PowerShell",
+                    estimated_savings_pct: 20.0,
+                    status: RtkStatus::Passthrough,
+                }
+            );
+            assert_eq!(
+                classify_command("Get-ChildItem ."),
+                Classification::Supported {
+                    rtk_equivalent: "rtk ls",
+                    category: "Files",
+                    estimated_savings_pct: 65.0,
+                    status: RtkStatus::Existing,
+                }
+            );
+            assert_eq!(
+                classify_command("dir src"),
+                Classification::Supported {
+                    rtk_equivalent: "rtk ls",
+                    category: "Files",
+                    estimated_savings_pct: 65.0,
+                    status: RtkStatus::Existing,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_get_content_as_read_on_windows() {
+        if cfg!(windows) {
+            assert_eq!(
+                classify_command("Get-Content README.md"),
+                Classification::Supported {
+                    rtk_equivalent: "rtk read",
+                    category: "Files",
+                    estimated_savings_pct: 60.0,
+                    status: RtkStatus::Existing,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_type_as_pwsh_on_windows() {
+        if cfg!(windows) {
+            assert_eq!(
+                classify_command("type README.md"),
+                Classification::Supported {
+                    rtk_equivalent: "rtk read",
+                    category: "Files",
+                    estimated_savings_pct: 60.0,
+                    status: RtkStatus::Existing,
+                }
+            );
+        }
     }
 
     #[test]
@@ -1140,6 +1421,51 @@ mod tests {
             rewrite_command("rg \"fn main\"", &[]),
             Some("rtk grep \"fn main\"".into())
         );
+    }
+
+    #[test]
+    fn test_rewrite_pwd_to_pwsh_on_windows() {
+        if cfg!(windows) {
+            assert_eq!(
+                rewrite_command("pwd", &[]),
+                Some(r#"rtk pwsh -Command "pwd""#.into())
+            );
+        }
+    }
+
+    #[test]
+    fn test_rewrite_get_child_item_to_ls_on_windows() {
+        if cfg!(windows) {
+            assert_eq!(
+                rewrite_command("Get-ChildItem -Force", &[]),
+                Some(r#"rtk pwsh -Command "Get-ChildItem -Force""#.into())
+            );
+            assert_eq!(
+                rewrite_command("Get-ChildItem .", &[]),
+                Some("rtk ls .".into())
+            );
+            assert_eq!(rewrite_command("dir src", &[]), Some("rtk ls src".into()));
+        }
+    }
+
+    #[test]
+    fn test_rewrite_get_content_to_read_on_windows() {
+        if cfg!(windows) {
+            assert_eq!(
+                rewrite_command("Get-Content README.md", &[]),
+                Some("rtk read README.md".into())
+            );
+        }
+    }
+
+    #[test]
+    fn test_rewrite_type_to_pwsh_on_windows() {
+        if cfg!(windows) {
+            assert_eq!(
+                rewrite_command("type README.md", &[]),
+                Some("rtk read README.md".into())
+            );
+        }
     }
 
     #[test]

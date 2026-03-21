@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-const CURRENT_HOOK_VERSION: u8 = 2;
+pub const CURRENT_HOOK_VERSION: u8 = 2;
 const WARN_INTERVAL_SECS: u64 = 24 * 3600;
 
 /// Hook status for diagnostics and `rtk gain`.
@@ -77,7 +77,18 @@ fn check_and_warn() -> Option<()> {
 pub fn parse_hook_version(content: &str) -> u8 {
     // Version tag must be in the first 5 lines (shebang + header convention)
     for line in content.lines().take(5) {
-        if let Some(rest) = line.strip_prefix("# rtk-hook-version:") {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("# rtk-hook-version:") {
+            if let Ok(v) = rest.trim().parse::<u8>() {
+                return v;
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("REM rtk-hook-version:") {
+            if let Ok(v) = rest.trim().parse::<u8>() {
+                return v;
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix(":: rtk-hook-version:") {
             if let Ok(v) = rest.trim().parse::<u8>() {
                 return v;
             }
@@ -87,8 +98,7 @@ pub fn parse_hook_version(content: &str) -> u8 {
 }
 
 fn hook_installed_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    let path = home.join(".claude").join("hooks").join("rtk-rewrite.sh");
+    let path = crate::integrity::resolve_hook_path().ok()?;
     if path.exists() {
         Some(path)
     } else {
@@ -124,6 +134,12 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_hook_version_windows_rem_comment() {
+        let content = "@echo off\nREM rtk-hook-version: 2\n";
+        assert_eq!(parse_hook_version(content), 2);
+    }
+
+    #[test]
     fn test_parse_hook_version_no_tag() {
         assert_eq!(parse_hook_version("no version here"), 0);
         assert_eq!(parse_hook_version(""), 0);
@@ -146,12 +162,12 @@ mod tests {
             Some(h) => h,
             None => return,
         };
-        if !home
-            .join(".claude")
-            .join("hooks")
-            .join("rtk-rewrite.sh")
-            .exists()
-        {
+        let hook_exists = crate::integrity::resolve_hook_path()
+            .ok()
+            .map(|p| p.exists())
+            .unwrap_or(false);
+
+        if !hook_exists {
             // No hook — status should be Missing (if .claude exists) or Ok (if not)
             let s = status();
             if home.join(".claude").exists() {

@@ -45,6 +45,7 @@ mod pnpm_cmd;
 mod prettier_cmd;
 mod prisma_cmd;
 mod psql_cmd;
+mod pwsh_cmd;
 mod pytest_cmd;
 mod read;
 mod rewrite_cmd;
@@ -215,6 +216,13 @@ enum Commands {
     /// PostgreSQL client with compact output (strip borders, compress tables)
     Psql {
         /// psql arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// PowerShell passthrough for builtins and aliases
+    Pwsh {
+        /// pwsh arguments, usually `-Command <expr>`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -548,7 +556,7 @@ enum Commands {
         args: Vec<String>,
     },
 
-    /// Discover missed RTK savings from Claude Code history
+    /// Discover missed RTK savings from Claude Code and Copilot shell history
     Discover {
         /// Filter by project path (substring match)
         #[arg(short, long)]
@@ -1465,6 +1473,10 @@ fn main() -> Result<()> {
             psql_cmd::run(&args, cli.verbose)?;
         }
 
+        Commands::Pwsh { args } => {
+            pwsh_cmd::run(&args, cli.verbose)?;
+        }
+
         Commands::Pnpm { command } => match command {
             PnpmCommands::List { depth, args } => {
                 pnpm_cmd::run(pnpm_cmd::PnpmCommand::List { depth }, &args, cli.verbose)?;
@@ -2225,6 +2237,7 @@ fn is_operational_command(cmd: &Commands) -> bool {
             | Commands::Smart { .. }
             | Commands::Git { .. }
             | Commands::Gh { .. }
+            | Commands::Pwsh { .. }
             | Commands::Pnpm { .. }
             | Commands::Err { .. }
             | Commands::Test { .. }
@@ -2438,6 +2451,20 @@ mod tests {
                     assert_eq!(directory, vec!["/path"]);
                 }
                 _ => panic!("Expected Git command"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_try_parse_pwsh_command_succeeds() {
+        let result = Cli::try_parse_from(["rtk", "pwsh", "-Command", "pwd"]);
+        assert!(result.is_ok(), "pwsh passthrough should parse successfully");
+        if let Ok(cli) = result {
+            match cli.command {
+                Commands::Pwsh { args } => {
+                    assert_eq!(args, vec!["-Command", "pwd"]);
+                }
+                _ => panic!("Expected Pwsh command"),
             }
         }
     }

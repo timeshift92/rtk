@@ -97,7 +97,8 @@ rtk gain  # MUST show token savings, not "command not found"
 
 ```bash
 rtk init -g
-# → Installs hook to ~/.claude/hooks/rtk-rewrite.sh
+# → Installs hook to ~/.claude/hooks/rtk-rewrite.sh (macOS/Linux)
+#   or ~/.claude/hooks/rtk-rewrite.cmd (Windows)
 # → Creates ~/.claude/RTK.md (10 lines, meta commands only)
 # → Adds @RTK.md reference to ~/.claude/CLAUDE.md
 # → Prompts: "Patch settings.json? [y/N]"
