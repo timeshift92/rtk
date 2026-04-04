@@ -371,7 +371,12 @@ mod tests {
 
     #[test]
     fn test_execute_command_success() {
+        #[cfg(target_os = "windows")]
+        let result = execute_command("cmd", &["/C", "echo", "test"]);
+
+        #[cfg(not(target_os = "windows"))]
         let result = execute_command("echo", &["test"]);
+
         assert!(result.is_ok());
         let (stdout, _, code) = result.unwrap();
         assert_eq!(code, 0);
