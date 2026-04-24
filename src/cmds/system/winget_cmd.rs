@@ -33,6 +33,21 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         eprintln!("Running: winget {}", args.join(" "));
     }
 
+    // Passthrough for help/version flags — don't filter help text
+    let has_help = args
+        .iter()
+        .any(|a| matches!(a.as_str(), "--help" | "-?" | "-h" | "--version"));
+
+    if has_help {
+        return runner::run_filtered(
+            cmd,
+            "winget",
+            &args.join(" "),
+            filter_strip_noise,
+            RunOptions::default(),
+        );
+    }
+
     match subcommand {
         "list" => runner::run_filtered(
             cmd,
